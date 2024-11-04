@@ -1,0 +1,283 @@
+# PACOTES: ----------------------------------------------------------------
+library(magrittr)
+library(ggplot2)
+
+
+# IMPORTAÇÃO: -------------------------------------------------------------
+bd_horario <- readxl::read_xlsx(path = 'base_horaria_code_muni.xlsx') 
+
+
+tibble::glimpse(bd_horario)
+
+# ARRUMAÇÃO: --------------------------------------------------------------
+# Parâmetros Econômicos
+cambio_nominal <- 5.4   # (R$/U$) 
+
+# Parâmetros Sistemas Fotovoltaicos (R$/kWp)
+capex_pv_2000 <- 3270
+capex_pv_4000 <- 3240
+capex_pv_6000 <- 3200
+tma <- 0.1
+tma_5 <- ((1+tma)^5)-1
+perdas_pv <- 0.2
+prop_capex_inv <- 0.3
+opex_pv <- 0.02 # do capex PV
+
+# Parâmetros de Baterias (U$/kWh)
+capex_bateria <- 415.2  # min: 140 U$/kWh - máx:855 U$/kWh
+round_trip_efficiency <- 1
+minimum_soc <- 0.80 
+
+# Parâmetros de Eletrolisadores 
+potencia_eletrolisador <- 1000 # (kW)
+capex_eletrolisador <- 1000 # (U$/kW)
+relacao_kwh_kg <- 1200
+capex_pilha <- 400 # (U$/kW)
+capex_armazenamento <- 63 # (U$/Nm³)
+densidade <- 0.0899 # (kg/m³)
+capacidade_armazenamento <- 1 # (dias)
+capacidade_compressor <- 5.09 # (kg/h)
+capex_compressor <- 1300 #U$/unidade (500w)
+opex_eletrolisador <- 0.02 # % do capex do eletrolisador 
+opex_armazenamento <- 0.005 # % do capex do armazenamento
+opex_compressor <- 0.008 # % do capex do compressor 
+consumo_agua <- (potencia_eletrolisador/1250)*0.34*24*251  # m³/ano
+custo_agua <-  2.43 # $/m³
+
+tictoc::tic()
+dimensionamentos <- bd_horario %>% 
+  dplyr::group_by(code_muni) %>% 
+  dplyr::summarise(lat = lat,
+                   long = long,
+                   hr = hr,
+                   media_horaria = media_horaria,
+                   total_dia = sum(media_horaria),
+                   prop_irradiacao = media_horaria/sum(media_horaria),
+                   potencia_pv = 24000/(sum(media_horaria)*(1-perdas_pv))) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::mutate(geracao_pv = potencia_pv*media_horaria) %>% 
+  dplyr::mutate(carregamento = ifelse(geracao_pv-1000>0,
+                                      (geracao_pv-1000)*sqrt(round_trip_efficiency),
+                                      0),
+                descarregamento = ifelse(geracao_pv-1000<0,
+                                         -1*(geracao_pv-1000)*sqrt(round_trip_efficiency),
+                                         0)) %>% 
+  as.data.frame() %>% 
+  dplyr::group_by(code_muni) %>%
+  dplyr::summarise(lat = lat,
+                   long = long,
+                   hr = hr,
+                   media_horaria = media_horaria,
+                   total_dia = total_dia,
+                   prop_irradiacao = prop_irradiacao,
+                   dimensionamento_pv = potencia_pv,
+                   dimensionamento_bateria = sum(carregamento)/(1-minimum_soc),
+                   geracao_pv,
+                   carregamento,
+                   descarregamento) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::mutate(prod_h2_ano = 24*251*potencia_eletrolisador/relacao_kwh_kg) %>% 
+  dplyr::mutate(capex_pv = dplyr::case_when(
+    dimensionamento_pv < 2000 ~  dimensionamento_pv*capex_pv_2000,
+    dimensionamento_pv >= 2000 & dimensionamento_pv <= 4000 ~  dimensionamento_pv*capex_pv_4000,
+    dimensionamento_pv > 4000 ~  dimensionamento_pv*capex_pv_6000),
+                capex_bateria = dimensionamento_bateria*capex_bateria*cambio_nominal + ((dimensionamento_bateria*capex_bateria*cambio_nominal)/((1+tma)^10))) %>%
+  dplyr::mutate(capex_pv = capex_pv + prop_capex_inv*capex_pv/((1+tma)^10)) %>% 
+  dplyr::mutate(capex_eletrolisador = (potencia_eletrolisador*capex_eletrolisador*cambio_nominal)+((potencia_eletrolisador*capex_pilha*cambio_nominal)*((((1+tma_5)^5)-1)/(((1+tma_5)^5)*tma_5)))) %>% 
+  dplyr::mutate(capex_armazenamento = (prod_h2_ano/densidade)*capacidade_armazenamento*capex_armazenamento*cambio_nominal) %>%
+  dplyr::mutate(capex_compressor = ceiling((5020/(251*3))/capacidade_compressor)*capex_compressor*cambio_nominal) %>% 
+  dplyr::mutate(capex_total = capex_pv + capex_eletrolisador + capex_armazenamento + capex_compressor) %>% 
+  dplyr::mutate(opex_pv = opex_pv*capex_pv*((((1+tma)^20)-1)/(((1+tma)^20)*tma))) %>% 
+  dplyr::mutate(opex_eletrolisador = opex_eletrolisador*capex_eletrolisador*((((1+tma)^20)-1)/(((1+tma)^20)*tma))) %>% 
+  dplyr::mutate(opex_armazenamento = opex_armazenamento*capex_armazenamento*((((1+tma)^20)-1)/(((1+tma)^20)*tma))) %>% 
+  dplyr::mutate(opex_compressor = opex_compressor*capex_compressor*((((1+tma)^20)-1)/(((1+tma)^20)*tma))) %>% 
+  dplyr::mutate(opex_agua = consumo_agua*custo_agua*((((1+tma)^20)-1)/(((1+tma)^20)*tma))) %>% 
+  dplyr::mutate(opex_total = opex_pv + opex_eletrolisador + opex_armazenamento+ opex_compressor + opex_agua) %>% 
+  dplyr::mutate(producao_total = prod_h2_ano*((((1+tma)^20)-1)/(((1+tma)^20)*tma))) %>% 
+  dplyr::mutate(lcoh = (capex_total + opex_total)/producao_total) 
+tictoc::toc()
+
+boxplot(dimensionamentos$dimensionamento_pv)
+boxplot(dimensionamentos$dimensionamento_bateria)
+boxplot(dimensionamentos$capex_pv)
+tibble::glimpse(dimensionamentos)
+
+# VISUALIZAÇÃO: -----------------------------------------------------------
+mapa <- geobr::read_municipality()
+
+graf_dispersao_horaria <- dimensionamentos %>% 
+  ggplot() + 
+  geom_boxplot(aes(x = as.factor(hr), y = media_horaria),
+               fill = '#73d055ff') + 
+  labs(title = '(A)',
+       x = 'Hours',
+       y = 'Solar Irradiance (kW/m²)') + 
+  theme_bw()
+
+graf_dispersao_horaria
+
+total_mapa <- dimensionamentos %>% 
+  dplyr::select(code_muni, media_horaria, lcoh) %>%
+  dplyr::group_by(code_muni) %>% 
+  dplyr::summarise(
+    sd_horario = sd(media_horaria),
+    lcoh = mean(lcoh)) %>%
+  dplyr::ungroup() %>% 
+  dplyr::mutate(
+    sd_horario = as.numeric(sd_horario),
+    lcoh = lcoh
+  )
+
+
+total_mapa <- mapa %>% 
+  dplyr::full_join(total_mapa, by = c('code_muni' = 'code_muni')) %>% 
+  tidyr::drop_na() 
+
+graf_disp_total_mapa <- total_mapa %>% 
+  ggplot() +
+  geom_sf(aes(fill = sd_horario), color = NA) +
+  scale_fill_viridis_c(direction = -1) + 
+  labs(title ='Solar Iradiation (kW/m²)',
+       x = '',
+       y = '',
+       fill = 'Standard Deviation') + 
+  theme_bw()
+ 
+
+ 
+cowplot::plot_grid(graf_dispersao_horaria,
+                   graf_disp_total_mapa,
+                   nrow = 2,
+                   ncol = 1,
+                   rel_heights = c(1, 1),
+                   align = 'h',
+                   axis = 'lr')
+
+
+
+
+
+graf_lcoh_mapa <- total_mapa %>% 
+  ggplot() +
+  geom_sf(aes(fill = lcoh), color = NA) +
+  scale_fill_viridis_c(direction = -1) + 
+  labs(title = 'Levilizes Cost Of Hydrogen (LCOH)',
+       x = '',
+       y = '',
+       fill = 'LCOH (USD/kg)') + 
+  theme_bw()
+
+
+graf_lcoh_mapa
+
+
+# MENOR LCOH MUNICIPIO ----------------------------------------------------
+
+
+menores_lcoh <- dimensionamentos %>%
+  dplyr::arrange(lcoh) %>%
+  dplyr::slice_head(n = 5)
+
+menores_lcoh
+
+
+
+##############################
+grafico_potencia_acumulada_br <-dados_br_mensal %>% 
+  ggplot() + 
+  geom_line(mapping = aes(x = ref_data,
+                          y = potencia_acumulada, 
+                          group = 1,
+                          text = paste0("Data: ",
+                                        format(ref_data, "%d-%m-%Y"),
+                                        "<br> ","Potência Acumulada: ",
+                                        scales::number(potencia_acumulada,
+                                                       accuracy =1 ,
+                                                       decimal.mark = ',',
+                                                       big.mark = '.'))),
+            color = "#07020D",
+            size = 0.5,
+            linetype = 1) +
+  geom_point(mapping = aes(x = ref_data,
+                           y =potencia_acumulada, 
+                           group = 1,
+                           text = paste0("Data: ",
+                                         format(ref_data, "%d-%m-%Y"),
+                                         "<br> ","Potência Acumulada: ",
+                                         scales::number(potencia_acumulada,
+                                                        accuracy =1 ,
+                                                        decimal.mark = ',',
+                                                        big.mark = '.'))),
+             color = "#3E4F5D",
+             size = 0.1,
+             linetype = 1) +
+  scale_y_continuous(labels = scales::number_format(accuracy = 1,
+                                                    decimal.mark = ',',
+                                                    big.mark = '.')) +
+  labs(title = 'Power Capacity Install',
+       subtitle = '',
+       x = 'Data',
+       y = 'kWp')
+
+
+plotly::ggplotly(grafico_potencia_acumulada_br,tooltip = "text")
+
+
+
+
+##########################################
+
+grafico_numero_istalacoes_acumulada_br<- dados_br_mensal %>% 
+  ggplot() + 
+  geom_line(mapping = aes(x = ref_data,
+                          y = numero_de_instalacoes_acumuladas, 
+                          group = 1,
+                          text = paste0("Data: ",
+                                        format(ref_data, "%d-%m-%Y"),
+                                        "<br> ","Número de de Intalaçoes Acumulada: ",
+                                        scales::number(numero_de_instalacoes_acumuladas,
+                                                       accuracy =1 ,
+                                                       decimal.mark = ',',
+                                                       big.mark = '.'))),
+            color = "#07020D",
+            size = 0.5,
+            linetype = 1) +
+  geom_point(mapping = aes(x = ref_data,
+                           y =numero_de_instalacoes_acumuladas, 
+                           group = 1,
+                           text = paste0("Data: ",
+                                         format(ref_data, "%d-%m-%Y"),
+                                         "<br> ","Número de de Instalações Acumulada: ",
+                                         scales::number(numero_de_instalacoes_acumuladas,
+                                                        accuracy =1 ,
+                                                        decimal.mark = ',',
+                                                        big.mark = '.'))),
+             color = "#3E4F5D",
+             size = 0.1,
+             linetype = 1) +
+  scale_y_continuous(labels = scales::number_format(accuracy = 1,
+                                                    decimal.mark = ',',
+                                                    big.mark = '.')) +
+  labs(title = ' Units Install',
+       subtitle = '',
+       x = 'Data',
+       y = 'Units')
+
+
+plotly::ggplotly(grafico_numero_istalacoes_acumulada_br,tooltip = "text")
+
+
+
+###################################
+
+cowplot::plot_grid(grafico_potencia_acumulada_br,
+                   grafico_numero_istalacoes_acumulada_br,
+                   nrow = 1,
+                   ncol = 2,
+                   rel_heights = c(1, 1),
+                   align = 'h',
+                   axis = 'lr')
+
+
+
+
